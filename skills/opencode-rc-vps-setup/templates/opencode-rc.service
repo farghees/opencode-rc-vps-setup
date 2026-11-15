@@ -1,0 +1,32 @@
+# systemd --user unit: OpenCode web (`opencode web`) in a detached tmux session.
+# Placeholders (__X__) are filled in by scripts/install.sh. Do not edit by hand
+# unless you know what you are changing.
+#   __TMUX__     absolute path to tmux          (command -v tmux)
+#   __WRAPPER__  absolute path to rc-run.sh     (installed next to rc.env)
+#   __BIND__     IPv4 address the web UI binds  (Tailscale IP by default; never 0.0.0.0)
+#   __PORT__     port the web UI listens on
+#   __WORKDIR__  directory OpenCode starts in
+
+[Unit]
+Description=OpenCode Web RC (__BIND__:__PORT__)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+WorkingDirectory=__WORKDIR__
+# systemd's user manager has a minimal PATH. The wrapper uses an absolute path to opencode anyway.
+Environment=PATH=%h/.opencode/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Own tmux socket (-L). Sharing the default tmux server with another unit (e.g. Claude Remote
+# Control) makes systemd lose track of this process. Keep the socket name unique per unit.
+ExecStartPre=-__TMUX__ -L opencode-rc kill-server
+# At boot the bind address may not exist yet. Wait up to 60s, then fail loudly.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip -4 addr show | grep -q "inet __BIND__/" && exit 0; sleep 1; done; echo "bind address __BIND__ not assigned after 60s" >&2; exit 1'
+# tmux -d detaches immediately; the wrapper loops and restarts opencode if it exits.
+ExecStart=__TMUX__ -L opencode-rc new -d -s opencode-rc __WRAPPER__
+ExecStop=__TMUX__ -L opencode-rc kill-server
+# Restart=no mirrors the reference setup: a crash inside the wrapper is handled by its own loop.
+Restart=no
+
+[Install]
+WantedBy=default.target
