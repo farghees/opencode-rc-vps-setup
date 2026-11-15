@@ -1,6 +1,6 @@
 ---
 name: opencode-rc-vps-setup
-description: Set up OpenCode web (`opencode web`) on a Linux VPS as a 24/7 remote-control service with a password, bound to a private address (Tailscale by default), using a systemd user unit and a detached tmux session. Use when the user asks to set up OpenCode web or OpenCode remote access on a VPS, "opencode RC", "run opencode web 24/7 with a password over Tailscale", "make opencode web survive reboot", or when an OpenCode web service on a server has dropped or will not start.
+description: Set up OpenCode web (`opencode web`) on a Linux VPS as a 24/7 remote-control service with a password, bound to a private address (Tailscale by default), using a systemd user unit and a detached tmux session. Optionally adds a tailnet-only HTTPS URL via Tailscale Serve. Use when the user asks to set up OpenCode web or OpenCode remote access on a VPS, "opencode RC", "run opencode web 24/7 with a password over Tailscale", "make opencode web survive reboot", or when an OpenCode web service on a server has dropped or will not start.
 ---
 
 # OpenCode web as a remote-control service on a VPS (systemd + tmux)
@@ -38,7 +38,7 @@ bash ~/.claude/skills/opencode-rc-vps-setup/scripts/install.sh
 # 3. Open the URL the installer prints and log in with the username and the password from rc.env.
 ```
 
-Options: `--port 4096`, `--bind <IPv4>`, `--username <name>`, `--workdir <dir>`. Run with `--help` for details.
+Options: `--port 4096`, `--bind <IPv4>`, `--username <name>`, `--workdir <dir>`, `--tailscale-serve`, `--serve-port 8443`. Run with `--help` for details. The HTTPS option is described in its own section below.
 
 ## What gets installed
 
@@ -49,6 +49,7 @@ Options: `--port 4096`, `--bind <IPv4>`, `--username <name>`, `--workdir <dir>`.
 | credentials and keys | `~/.config/opencode/rc.env` (mode 600) | Basic-auth user and password, provider API keys |
 | detached tmux session | own tmux server on socket `opencode-rc`, session `opencode-rc` | Keeps the web UI running with no terminal |
 | linger | `loginctl enable-linger $USER` | User manager, and so the unit, starts at boot |
+| Tailscale Serve (only with `--tailscale-serve`) | `tailscale serve` config, kept by tailscaled | Tailnet-only HTTPS URL in front of the service, persists across reboots |
 
 `templates/opencode-rc.service` and `templates/rc-run.sh` are the templates. `scripts/install.sh` fills
 in the absolute paths, the bind address, the port and the working directory. Nothing is hardcoded to a user.
@@ -108,6 +109,8 @@ tmux -L opencode-rc ls                         # opencode-rc: 1 windows (...)
 curl -s -o /dev/null -w '%{http_code}\n' http://<bind-ip>:4096/                       # 401
 curl -s -o /dev/null -w '%{http_code}\n' -K <(printf 'user = "%s:%s"\n' "$U" "$P") http://<bind-ip>:4096/   # 200
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4096/                       # 000 (refused) when bound to a non-loopback IP
+tailscale serve status                          # with --tailscale-serve: https://<machine>.<tailnet>.ts.net:8443 (tailnet only)
+curl -s -o /dev/null -w '%{http_code}\n' https://<machine>.<tailnet>.ts.net:8443/     # 401 (valid cert, no -k)
 ```
 
 Read `$U` and `$P` from `rc.env` in your shell, for example with `. ~/.config/opencode/rc.env`. Do not
@@ -129,6 +132,42 @@ paste the password into chat or a log.
 The URL is plain HTTP. Tailscale's WireGuard tunnel encrypts the path between your devices. Do not
 publish the port on a public interface, and do not put it behind a public reverse proxy without TLS
 and extra access control.
+
+## Optional: a tailnet-only HTTPS URL (Tailscale Serve)
+
+Plain HTTP over the tailnet works, but some browsers and phone features want HTTPS. With
+`--tailscale-serve` the installer puts the service behind Tailscale Serve. You get a URL of the form
+`https://<machine>.<tailnet>.ts.net:<port>/` with a valid certificate. It is reachable only from
+devices on your tailnet. The plain `http://<bind-ip>:<port>/` URL keeps working as well.
+
+```bash
+bash ~/.claude/skills/opencode-rc-vps-setup/scripts/install.sh --tailscale-serve                    # HTTPS on port 8443
+bash ~/.claude/skills/opencode-rc-vps-setup/scripts/install.sh --tailscale-serve --serve-port 10000
+```
+
+**One-time admin step.** Tailscale Serve must be enabled for the tailnet. If it is not, the installer
+prints a link such as `https://login.tailscale.com/f/serve?node=...`. Open it, enable Serve, then
+re-run the same command. The service keeps running in the meantime. The installer never waits longer
+than 60 seconds for the `tailscale` command, because that command blocks until Serve is enabled.
+
+**Port.** The default is 8443. Port 443 is often used by another web server on the host (for example
+Caddy on `*:443`). If the chosen port already has a Serve handler that points somewhere else, the
+installer refuses to overwrite it. Choose another `--serve-port`.
+
+**What the installer checks.** The `tailscale serve status` line for the port must say `(tailnet only)`.
+The URL must answer HTTP 401 without credentials and HTTP 200 with them, and the certificate must
+validate without `-k`. The certificate can take a minute to appear, so the installer retries for a while.
+If a check still fails, the installer prints a warning and no URL. The service itself is unaffected.
+
+**Re-running is safe.** If the port already proxies to this service, nothing changes and only the checks
+run. `uninstall.sh` removes the Serve handler only when it proxies to this service's bind address and
+port. Other Serve handlers are never touched.
+
+**Phone tip.** Join the phone to the tailnet with the Tailscale app, open the HTTPS URL in the browser,
+then choose "Add to Home Screen" to get an icon that opens it like an app.
+
+**Never use `tailscale funnel` for this.** Funnel publishes the URL to the public internet, and the
+web UI can run shell commands. Serve is tailnet only. Check with `tailscale serve status`.
 
 ## Logs
 
@@ -167,6 +206,14 @@ Use `-r` on `attach`. It is read-only, so a stray keypress cannot reach the shel
 | `Failed to connect to bus` over SSH | No `XDG_RUNTIME_DIR` in the SSH session | `export XDG_RUNTIME_DIR=/run/user/$(id -u)` |
 | `--bind 0.0.0.0` refused | Wildcard binds expose the shell to every network | Bind to the Tailscale or another private IP |
 | Pane shows `opencode exited (...), restarting in 5s` repeatedly | OpenCode crashes at start (bad config, bad model id, missing key) | Read the pane: `tmux -L opencode-rc capture-pane -p -t opencode-rc \| tail -n 40`. Fix `opencode.jsonc` or `rc.env` |
+| Installer: "Tailscale Serve is not enabled on this tailnet" | One-time admin step not done yet | Open the printed `login.tailscale.com/f/serve?node=...` link, enable Serve, then re-run with `--tailscale-serve`. The HTTP URL works in the meantime |
+| Installer warns that `tailscale serve` "did not finish within 60s" | The command was waiting for the Serve enable step (it blocks until then) | Same fix as above. The installer uses `timeout` on purpose, so it cannot hang |
+| `tailscale serve` fails on 443, or 443 is busy | Another web server (e.g. Caddy on `*:443`) holds 443 | Use the default `--serve-port 8443`, or any free port |
+| Installer: port already has a Serve handler for something else | The chosen HTTPS port is used by another Serve config | Pick another port with `--serve-port`. The installer does not overwrite it |
+| HTTPS URL returns `000` right after enabling Serve | The certificate is still being issued | Wait a minute and retry. The installer retries automatically for about a minute |
+| HTTPS returns 000 for a long time | The machine has no tailnet DNS name yet, or MagicDNS/HTTPS certificates are off in the admin console | `tailscale status --json` must show a `DNSName`. Check the admin console DNS settings |
+| `tailscale serve status` shows `(Funnel on)`, or the URL works from outside the tailnet | Funnel is on for that port, which publishes it to the internet | Remove it: `sudo tailscale serve --https=<port> off`. Confirm `tailscale serve status` shows `(tailnet only)`. Do not use funnel for this skill |
+| uninstall leaves a Serve handler in place | The handler proxies to a different address or port than this service | Expected. Serve is only changed when it proxies to this service. Remove other handlers by hand if you no longer want them |
 | Wrapper stops at start with "... is not set in rc.env" | Credentials missing, deliberately refused | Re-run `install.sh` or add the keys to `rc.env` |
 
 ## Uninstall
@@ -178,6 +225,8 @@ bash ~/.claude/skills/opencode-rc-vps-setup/scripts/uninstall.sh --disable-linge
 ```
 
 This stops the service, disables and removes the unit and the wrapper, and resets the failed state.
+If a Tailscale Serve handler on `--serve-port` (default 8443) proxies to this service, the handler is
+removed too. Other Serve handlers are never touched.
 OpenCode itself, `opencode.jsonc` and the rest of `~/.config/opencode` are not touched.
 
 ## Security notes
@@ -188,12 +237,15 @@ OpenCode itself, `opencode.jsonc` and the rest of `~/.config/opencode` are not t
 - `opencode.jsonc` should hold no secrets. Keep keys in `rc.env`.
 - The wrapper refuses to start without both `OPENCODE_SERVER_*` values, so the UI never runs open by accident.
 - Tailscale ACLs decide which devices can reach the port. Restrict them if other people share the tailnet.
+- Tailscale Serve (`--tailscale-serve`) is tailnet only. Never switch it to funnel, which is public.
 
 ## Files in this skill
 
 - `scripts/install.sh`: prerequisite and bind-address checks, linger, creates `rc.env` or adds only
   missing keys, writes the wrapper and unit from the templates, enables and starts the service, runs the
   401 and 200 checks, prints the URL and the command to view the password. Idempotent. Run with `--help`.
-- `scripts/uninstall.sh`: reverses the install. Keeps `rc.env` unless `--purge` is given.
+  With `--tailscale-serve` it also sets up the tailnet-only HTTPS handler and verifies it.
+- `scripts/uninstall.sh`: reverses the install. Keeps `rc.env` unless `--purge` is given. Removes a
+  Serve handler on `--serve-port` only if it proxies to this service.
 - `templates/opencode-rc.service`: the unit template (placeholders `__TMUX__`, `__WRAPPER__`, `__BIND__`, `__PORT__`, `__WORKDIR__`).
 - `templates/rc-run.sh`: the wrapper template (placeholders `__ENV_FILE__`, `__WORKDIR__`, `__OPENCODE__`, `__BIND__`, `__PORT__`).

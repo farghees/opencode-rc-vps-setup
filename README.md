@@ -24,6 +24,7 @@ Sister project for Claude Code: [claude-rc-vps-setup](https://github.com/farghee
   address passed with `--bind`
 - A provider API key for OpenCode (for example `OPENROUTER_API_KEY`), added after install
 - sudo, once, to enable linger
+- Optional, for `--tailscale-serve`: the `tailscale` CLI, and Serve enabled once for your tailnet
 
 ## Install
 
@@ -56,6 +57,8 @@ Options:
 | `--bind IP` | `tailscale ip -4` | IPv4 address to listen on. `0.0.0.0`, `::` and public addresses are refused. Loopback is allowed but reachable only from the host |
 | `--username NAME` | `admin` | Basic-auth user name. Written only if `rc.env` has none yet |
 | `--workdir DIR` | `$HOME` | Directory OpenCode starts in |
+| `--tailscale-serve` | off | Also publish the service at a tailnet-only HTTPS URL with Tailscale Serve (see below) |
+| `--serve-port N` | `8443` | HTTPS port for Tailscale Serve. Port 443 is often used by another web server |
 
 Example with explicit values:
 
@@ -70,6 +73,26 @@ if they changed) and never overwrites existing credentials or provider keys.
 
 From a device on the same tailnet, browse to `http://<bind-address>:<port>` and sign in with the
 user name and password from `rc.env`.
+
+## Optional: an HTTPS URL on the tailnet (Tailscale Serve)
+
+With `--tailscale-serve` the installer also puts the service behind Tailscale Serve, which gives a
+URL of the form `https://<machine>.<tailnet>.ts.net:8443/` with a valid certificate:
+
+```bash
+bash ~/.claude/skills/opencode-rc-vps-setup/scripts/install.sh --tailscale-serve
+```
+
+- **One-time admin step:** Serve must be enabled for your tailnet. If it is not, the installer prints
+  a `login.tailscale.com/f/serve?node=...` link. Enable Serve there, then re-run the command. The
+  service runs either way.
+- **Tailnet only.** Serve is never Funnel. Funnel would publish the UI to the internet.
+- **Phone:** join the tailnet with the Tailscale app, open the HTTPS URL, then use "Add to Home Screen".
+- The installer checks the URL (401 without credentials, 200 with them) and refuses to overwrite a
+  Serve handler on the same port that points elsewhere. `uninstall.sh` removes the handler only when
+  it proxies to this service.
+
+Details and troubleshooting are in `skills/opencode-rc-vps-setup/SKILL.md`.
 
 ## View the password
 
@@ -108,11 +131,13 @@ bash ~/.claude/skills/opencode-rc-vps-setup/scripts/uninstall.sh --purge        
 bash ~/.claude/skills/opencode-rc-vps-setup/scripts/uninstall.sh --disable-linger     # also turns off linger (affects all user services)
 ```
 
-OpenCode itself, `opencode.jsonc` and the rest of `~/.config/opencode` are not touched.
+OpenCode itself, `opencode.jsonc` and the rest of `~/.config/opencode` are not touched. A Tailscale Serve
+handler on `--serve-port` (default 8443) is removed only if it proxies to this service.
 
 ## Security notes
 
 - The unit binds to one private address. It never binds `0.0.0.0`.
+- The optional Serve URL is tailnet only. Do not switch it to `tailscale funnel`, which is public.
 - The wrapper refuses to start without `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`.
 - Anyone who can sign in can run commands as your user on the VPS. Keep the port off the public
   internet, keep Tailscale ACLs tight, and rotate the password by editing `rc.env` and restarting.

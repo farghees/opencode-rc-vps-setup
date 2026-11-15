@@ -5,11 +5,15 @@
 #
 # Usage:
 #   install.sh [--port N] [--bind IP] [--username NAME] [--workdir DIR]
-#     --port      port to listen on (default 4096)
-#     --bind      IPv4 address to listen on (default: `tailscale ip -4`).
-#                 0.0.0.0 and public addresses are refused. Loopback is allowed but local only.
-#     --username  basic-auth user name, written only if rc.env has none (default admin)
-#     --workdir   directory OpenCode starts in (default $HOME)
+#              [--tailscale-serve] [--serve-port N]
+#     --port             port to listen on (default 4096)
+#     --bind             IPv4 address to listen on (default: `tailscale ip -4`).
+#                        0.0.0.0 and public addresses are refused. Loopback is allowed but local only.
+#     --username         basic-auth user name, written only if rc.env has none (default admin)
+#     --workdir          directory OpenCode starts in (default $HOME)
+#     --tailscale-serve  also publish the service at a tailnet-only HTTPS URL with
+#                        `tailscale serve` (off by default). Needs a one-time admin-console enable.
+#     --serve-port       HTTPS port for Tailscale Serve (default 8443; 443 is often taken)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +37,10 @@ say()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+TS_SERVE=0
+SERVE_PORT=8443
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,6 +48,8 @@ while [ $# -gt 0 ]; do
     --bind)     BIND="${2:?--bind needs a value}"; shift 2 ;;
     --username) USERNAME_NEW="${2:?--username needs a value}"; shift 2 ;;
     --workdir)  WORKDIR="${2:?--workdir needs a value}"; shift 2 ;;
+    --tailscale-serve) TS_SERVE=1; shift ;;
+    --serve-port)      SERVE_PORT="${2:?--serve-port needs a value}"; shift 2 ;;
     -h|--help)  usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -57,6 +66,9 @@ command -v openssl >/dev/null 2>&1 || die "openssl is needed to generate the pas
 command -v curl    >/dev/null 2>&1 || die "curl is needed for the checks."
 command -v python3 >/dev/null 2>&1 || die "python3 is needed to validate the bind address."
 TMUX_BIN="$(readlink -f "$(command -v tmux)")"
+if [ "$TS_SERVE" = 1 ]; then
+  command -v tailscale >/dev/null 2>&1 || die "--tailscale-serve needs the tailscale CLI on this host."
+fi
 
 # The unit's PATH and non-interactive shells do not reliably find opencode, so use an absolute path.
 OPENCODE_BIN=""
@@ -101,6 +113,9 @@ esac
 
 case "$PORT" in ''|*[!0-9]*) die "--port must be a number" ;; esac
 [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || die "--port must be between 1024 and 65535"
+case "$SERVE_PORT" in ''|*[!0-9]*) die "--serve-port must be a number" ;; esac
+[ "$SERVE_PORT" -ge 1 ] && [ "$SERVE_PORT" -le 65535 ] || die "--serve-port must be between 1 and 65535"
+[ "$SERVE_PORT" != "$PORT" ] || die "--serve-port must differ from --port"
 [[ "$USERNAME_NEW" =~ ^[A-Za-z0-9._-]+$ ]] || die "--username may only contain letters, digits, '.', '_' and '-'."
 [ -d "$WORKDIR" ] || die "--workdir does not exist: $WORKDIR"
 WORKDIR="$(cd "$WORKDIR" && pwd)"
@@ -112,6 +127,7 @@ echo "tmux:     $TMUX_BIN"
 echo "opencode: $OPENCODE_BIN ($("$OPENCODE_BIN" --version 2>/dev/null || echo unknown version))"
 echo "bind:     $BIND:$PORT"
 echo "dir:      $WORKDIR"
+if [ "$TS_SERVE" = 1 ]; then echo "serve:    tailnet-only HTTPS on port $SERVE_PORT (Tailscale Serve)"; fi
 
 if systemctl --user is-active --quiet "$UNIT_NAME"; then
   echo "port:     $UNIT_NAME is already running and will be restarted"
@@ -248,6 +264,112 @@ else
   warn "unit is not active. Check: journalctl --user -u $UNIT_NAME -n 50"
 fi
 
+# ---------- 7. Optional: tailnet-only HTTPS URL via Tailscale Serve ----------
+# Serve is tailnet only. Never use `tailscale funnel` here: it publishes the UI to the internet.
+# Problems in this step are reported as warnings; the service above is already running.
+SERVE_URL=""
+SERVE_TARGET="http://$BIND:$PORT"
+
+# Prints one word: none (no handler on the port), same (already proxies to this service),
+# other (the port serves something else), or error (status could not be read).
+serve_state() {
+  local json
+  json="$(timeout 20 tailscale serve status --json 2>/dev/null)" || { echo error; return 0; }
+  SERVE_JSON="$json" python3 - "$SERVE_PORT" "$SERVE_TARGET" <<'PY' || echo error
+import json, os, sys
+port, target = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.loads(os.environ.get("SERVE_JSON") or "{}")
+except ValueError:
+    print("error"); sys.exit(0)
+proxies = []
+for key, site in (cfg.get("Web") or {}).items():
+    if key.rsplit(":", 1)[-1] == port:
+        for handler in ((site or {}).get("Handlers") or {}).values():
+            proxies.append((handler or {}).get("Proxy", ""))
+if not proxies:
+    print("other" if (cfg.get("TCP") or {}).get(port) else "none")
+elif all(p == target for p in proxies):
+    print("same")
+else:
+    print("other")
+PY
+}
+
+# Creates the handler. Returns 1 (with a message) when Serve is not enabled, blocks, or fails.
+serve_apply() {
+  local out rc enable_url
+  out="$(mktemp)"
+  # Cache sudo first, so the 60s timeout cannot cut off a password prompt.
+  sudo -v 2>/dev/null || true
+  set +e
+  timeout -k 5 60 sudo tailscale serve --bg --https="$SERVE_PORT" "$SERVE_TARGET" >"$out" 2>&1
+  rc=$?
+  set -e
+  if grep -q "Serve is not enabled" "$out"; then
+    enable_url="$(grep -oE 'https://login\.tailscale\.com/[^[:space:]]+' "$out" | head -n 1 || true)"
+    warn "Tailscale Serve is not enabled on this tailnet. This is a one-time admin-console step."
+    if [ -n "$enable_url" ]; then echo "  Enable it at: $enable_url" >&2; fi
+    echo "  Then re-run install.sh with --tailscale-serve. The service keeps running meanwhile." >&2
+    rm -f "$out"; return 1
+  fi
+  if [ "$rc" = 124 ]; then
+    warn "tailscale serve did not finish within 60s and was stopped. It may be waiting for Serve to be enabled. Check: tailscale serve status"
+  elif [ "$rc" != 0 ]; then
+    warn "tailscale serve failed (exit $rc): $(tail -n 3 "$out" | tr '\n' ' ')"
+  fi
+  rm -f "$out"
+  [ "$rc" = 0 ]
+}
+
+# Confirms the handler is tailnet only and that HTTPS answers 401 without and 200 with credentials.
+# Sets SERVE_URL only when all of that passes. Tailscale certificates can take a minute to appear.
+serve_verify() {
+  local status_txt line dns_name url code auth_code
+  status_txt="$(timeout 20 tailscale serve status 2>/dev/null || true)"
+  line="$(printf '%s\n' "$status_txt" | grep -F ":$SERVE_PORT" || true)"
+  case "$line" in
+    *"(tailnet only)"*) echo "serve status: port $SERVE_PORT is (tailnet only)" ;;
+    *) warn "tailscale serve status does not show port $SERVE_PORT as (tailnet only). No URL published. Check: tailscale serve status"; return 1 ;;
+  esac
+
+  dns_name="$(timeout 20 tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Self",{}).get("DNSName","").rstrip("."))' 2>/dev/null)" || dns_name=""
+  if [ -z "$dns_name" ]; then warn "could not read this machine's Tailscale DNS name. Check: tailscale status"; return 1; fi
+  url="https://$dns_name:$SERVE_PORT/"
+
+  code=000
+  for _ in $(seq 1 20); do
+    code="$(http_code "$url")"
+    [ "$code" != 000 ] && break
+    sleep 3
+  done
+  if [ "$code" != 401 ]; then
+    warn "$url without credentials: HTTP $code (expected 401). The certificate may still be provisioning; re-run in a minute."
+    return 1
+  fi
+  echo "https without credentials: HTTP 401 (ok)"
+
+  auth_code="$(http_code -K <(printf 'user = "%s:%s"\n' "$U" "$P") "$url")"
+  if [ "$auth_code" != 200 ]; then
+    warn "https with credentials: HTTP $auth_code (expected 200). If you edited rc.env, restart the unit."
+    return 1
+  fi
+  echo "https with credentials:    HTTP 200 (ok)"
+  SERVE_URL="$url"
+}
+
+if [ "$TS_SERVE" = 1 ]; then
+  say "Tailscale Serve (tailnet-only HTTPS on port $SERVE_PORT)"
+  SERVE_READY=0
+  case "$(serve_state)" in
+    same)  echo "serve: port $SERVE_PORT already proxies to $SERVE_TARGET (nothing to change)"; SERVE_READY=1 ;;
+    none)  if serve_apply; then SERVE_READY=1; fi ;;
+    other) warn "port $SERVE_PORT already has a Serve handler or listener for something else. Not overwriting it. Re-run with another --serve-port." ;;
+    *)     warn "could not read Tailscale Serve status. Not changing Serve. Check: tailscale serve status" ;;
+  esac
+  if [ "$SERVE_READY" = 1 ]; then serve_verify || true; fi
+fi
+
 say "Done"
 cat <<EOF
   Open:           $URL
@@ -259,3 +381,9 @@ cat <<EOF
   Linger check:   loginctl show-user $ME -p Linger
 The web UI is plain HTTP. Keep it on the private address only; it gives shell access.
 EOF
+if [ -n "$SERVE_URL" ]; then
+  echo "  HTTPS (tailnet only): $SERVE_URL"
+  echo "  Phone tip: open that URL in the browser and choose 'Add to Home Screen'."
+elif [ "$TS_SERVE" = 1 ]; then
+  echo "  HTTPS: not published (see the warnings above). Fix them and re-run with --tailscale-serve."
+fi
